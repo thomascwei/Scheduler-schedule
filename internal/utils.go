@@ -12,6 +12,8 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"path"
+	"path/filepath"
 	"scheduler/pkg/db"
 	"strconv"
 	"strings"
@@ -39,13 +41,17 @@ func contains(s []string, str string) bool {
 }
 
 // 讀專案中的config檔
-func LoadConfig(path string) (config Config) {
-	viper.AddConfigPath(path)
+func LoadConfig(mypath string) (config Config) {
+	viper.AddConfigPath(mypath)
+	// 為了讓執行test也能讀到config添加索引路徑
+	wd, err := os.Getwd()
+	parent := filepath.Dir(wd)
+	viper.AddConfigPath(path.Join(parent, mypath))
 	viper.SetConfigName("app")
 	viper.SetConfigType("yaml")
 	// 若有同名環境變量則使用環境變量
 	viper.AutomaticEnv()
-	err := viper.ReadInConfig()
+	err = viper.ReadInConfig()
 	if err != nil {
 		log.Fatal("can not load config: " + err.Error())
 	}

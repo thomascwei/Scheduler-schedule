@@ -38,8 +38,7 @@ func TestPrepareScheduleStoreInCache(t *testing.T) {
 	row := myDB.QueryRow("SELECT MAX(id) FROM schedules where end_date>now()")
 	err = row.Scan(&MaxId)
 	require.NoError(t, err)
-	config, err := LoadConfig("../config")
-	require.NoError(t, err)
+	config := LoadConfig("../config")
 	err = PrepareAllScheduleStoreInCache(config)
 	require.NoError(t, err)
 
@@ -58,8 +57,7 @@ func TestPrepareScheduleStoreInCache(t *testing.T) {
 }
 
 func TestPrepareAllCommandsStoreInCache(t *testing.T) {
-	config, err := LoadConfig("../config")
-	require.NoError(t, err)
+	config := LoadConfig("../config")
 	err = PrepareAllCommandsStoreInCache(config)
 	require.NoError(t, err)
 
@@ -89,8 +87,7 @@ func TestPrepareAllCommandsStoreInCache(t *testing.T) {
 }
 
 func TestGocronRealAllCachedSchedule(t *testing.T) {
-	config, err := LoadConfig("../config")
-	require.NoError(t, err)
+	config := LoadConfig("../config")
 	err = PrepareAllCommandsStoreInCache(config)
 	require.NoError(t, err)
 	err = PrepareAllScheduleStoreInCache(config)
