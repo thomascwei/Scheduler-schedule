@@ -2,11 +2,14 @@ package internal
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"github.com/bluele/gcache"
+	"github.com/jinzhu/copier"
 	"github.com/spf13/viper"
+	"google.golang.org/grpc"
 	"io"
 	"io/ioutil"
 	"log"
@@ -15,6 +18,7 @@ import (
 	"path"
 	"path/filepath"
 	"scheduler/pkg/db"
+	"scheduler/pkg/pb"
 	"strconv"
 	"strings"
 	"time"
@@ -205,6 +209,38 @@ func GetScheduleOne(config Config, ID int) (result ScheduleOneResult, err error)
 	}
 	return
 }
+func GRPCGetScheduleOne(config Config, ID int32) (result ScheduleOneResult, err error) {
+	address := fmt.Sprintf("%v:%v", config.Host, config.GRPCPort)
+	conn, err := grpc.Dial(address, grpc.WithInsecure())
+	if err != nil {
+		Error.Println(err)
+		result.Error = err.Error()
+		return
+	}
+	defer conn.Close()
+	c := pb.NewGetScheduleCRUDServiceClient(conn) // Creates a new instance of a hello client, defined in the protocol buffer file
+	resp, err := c.GetScheduleOne(context.Background(), &pb.GetScheduleOneReq{Id: ID})
+	if err != nil {
+		Error.Println(err)
+		result.Error = err.Error()
+		return
+	}
+	err = copier.Copy(&result.Data.Schedule, resp)
+	if err != nil {
+		Error.Println(err)
+		result.Error = err.Error()
+		return
+	}
+	// copier僅能複製名稱與型態相同的field, 所以不能複製的要個別賦予
+	result.Data.ID = resp.Id
+	result.Data.TimeTypeID = resp.TimeTypeId
+	result.Data.CommandID = resp.CommandId
+	result.Data.StartDate = resp.StartDate.AsTime()
+	result.Data.EndDate = resp.EndDate.AsTime()
+	result.Data.CreateTime = resp.CreateTime.AsTime()
+	result.Result = "ok"
+	return
+}
 
 func GetALlCommands(url string) (result []db.Command, err error) {
 	client := &http.Client{}
@@ -246,6 +282,47 @@ func PrepareAllCommandsStoreInCache(config Config) (err error) {
 	if err != nil {
 		return
 	}
+	allCommandsWithoutDate := make([]cacheCommand, 0)
+	for _, v := range allCommands {
+		singleCommand := cacheCommand{}
+		singleCommand.ID = v.ID
+		singleCommand.Command = v.Command
+		allCommandsWithoutDate = append(allCommandsWithoutDate, singleCommand)
+	}
+	err = GC.Set("command", allCommandsWithoutDate)
+	if err != nil {
+		return
+	}
+	Info.Println("finish commands cache init")
+	return
+}
+
+// 將所有command存進cache, gRPC版
+func GPRCPrepareAllCommandsStoreInCache(config Config) (err error) {
+	address := fmt.Sprintf("%v:%v", config.Host, config.GRPCPort)
+	conn, err := grpc.Dial(address, grpc.WithInsecure())
+	if err != nil {
+		Error.Println(err)
+		return
+	}
+	defer conn.Close()
+	c := pb.NewGetScheduleCRUDServiceClient(conn) // Creates a new instance of a hello client, defined in the protocol buffer file
+	resp, err := c.GetCommands(context.Background(), &pb.Empty{})
+	if err != nil {
+		Error.Println(err)
+		return
+	}
+	allCommands := make([]cacheCommand, 0)
+	Trace.Printf("+%v\n", resp)
+	for _, v := range resp.Command {
+		Trace.Printf("+%v\n", v)
+		oneCommand := cacheCommand{}
+		oneCommand.ID = v.Id
+		oneCommand.Command = v.Command
+		allCommands = append(allCommands, oneCommand)
+	}
+	Trace.Println("")
+
 	err = GC.Set("command", allCommands)
 	if err != nil {
 		return
@@ -255,349 +332,367 @@ func PrepareAllCommandsStoreInCache(config Config) (err error) {
 }
 
 // 讀取所有cache裡的schedule後逐一開goroutine檢查
-func GocronRealAllCachedSchedule() error {
-	current := time.Now().Round(time.Second)
-	//Trace.Println(current)
-	schedules := GC.GetALL(true)
-	delete(schedules, "command")
+func GocronRealAllCachedSchedule(closing chan struct{}) {
+	for {
+		select {
+		case <-closing:
+			Info.Println("closing")
+			return
+		default:
+			current := time.Now().Round(time.Second)
+			Trace.Println(current)
+			schedules := GC.GetALL(true)
+			delete(schedules, "command")
 
-	for _, s := range schedules {
-		ss, ok := s.(ScheduleOne)
-		if !ok {
-			Error.Println("type assert error")
-			return errors.New("type assert error")
-		}
-		if ss.Enable {
-			go GoroutineScheduleTriggerCheck(ss, current)
+			for _, s := range schedules {
+				ss, ok := s.(ScheduleOne)
+				if !ok {
+					Error.Println("type assert error")
+					return
+				}
+				if ss.Enable {
+					go GoroutineScheduleTriggerCheck(closing, ss, current)
+				}
+			}
+			return
 		}
 	}
-	return nil
+
 }
 
 // 檢查schedule規則套用當前時間是否會觸發
-func GoroutineScheduleTriggerCheck(schedule ScheduleOne, BaseTime time.Time) error {
+func GoroutineScheduleTriggerCheck(close chan struct{}, schedule ScheduleOne, BaseTime time.Time) {
 	//Trace.Println(schedule)
-	StartYear, StartMonth, StartDay := schedule.StartDate.Date()
-	BaseYear, BaseMonth, BaseDay := BaseTime.Date()
-	switch schedule.TimeTypeID {
-	// 只執行一次, 計算出唯一的執行時間比對符合後觸發
-	case 0:
-		HHMMSS := strings.Split(schedule.AtTime, ":")
-		HH, err := strconv.Atoi(HHMMSS[0])
-		if err != nil {
-			Error.Println(err)
-			return err
-		}
-		MM, err := strconv.Atoi(HHMMSS[1])
-		if err != nil {
-			Error.Println(err)
-			return err
-		}
-		SS, err := strconv.Atoi(HHMMSS[2])
-		if err != nil {
-			Error.Println(err)
-			return err
-		}
-
-		targetTime := time.Date(StartYear, StartMonth, StartDay, HH, MM, SS, 0, time.Local)
-		timeDiff := targetTime.Sub(BaseTime)
-		//Trace.Println(targetTime, current, timeDiff)
-		if timeDiff == 0 {
-			GetCommandFromCacheAndPublish(schedule.CommandID)
-		}
-		Trace.Println("schedule", schedule.ID, "非指定時間,直接結束")
-	// 指定日期區間內->每天(間隔?天)->指定時間區間內->指定間隔秒數
-	case 1:
-		// 未達開始日期,直接結束
-		if schedule.StartDate.Sub(BaseTime) > 0 {
-			Trace.Println("schedule", schedule.ID, "未達開始日期,直接結束")
-			return nil
-		}
-		// 超過結束日期,直接結束
-		if schedule.EndDate.Sub(BaseTime) < 0 {
-			Trace.Println("schedule", schedule.ID, "超過結束日期,直接結束")
-			return nil
-		}
-		// 未達開始時間,直接結束
-		HHMMSS := strings.Split(schedule.StartTime, ":")
-		HH, err := strconv.Atoi(HHMMSS[0])
-		if err != nil {
-			Error.Println(err)
-			return err
-		}
-		MM, err := strconv.Atoi(HHMMSS[1])
-		if err != nil {
-			Error.Println(err)
-			return err
-		}
-		SS, err := strconv.Atoi(HHMMSS[2])
-		if err != nil {
-			Error.Println(err)
-			return err
-		}
-		StartTime := time.Date(BaseYear, BaseMonth, BaseDay, HH, MM, SS, 0, time.Local)
-		if StartTime.Sub(BaseTime) > 0 {
-			Trace.Println("schedule", schedule.ID, "未達開始時間,直接結束")
-			return nil
-		}
-		// 超過結束時間,直接結束
-		HHMMSS = strings.Split(schedule.EndTime, ":")
-		HH, err = strconv.Atoi(HHMMSS[0])
-		if err != nil {
-			Error.Println(err)
-			return err
-		}
-		MM, err = strconv.Atoi(HHMMSS[1])
-		if err != nil {
-			Error.Println(err)
-			return err
-		}
-		SS, err = strconv.Atoi(HHMMSS[2])
-		if err != nil {
-			Error.Println(err)
-			return err
-		}
-		EndTime := time.Date(BaseYear, BaseMonth, BaseDay, HH, MM, SS, 0, time.Local)
-		if EndTime.Sub(BaseTime) < 0 {
-			Trace.Println("schedule", schedule.ID, "超過結束時間,直接結束")
-			return nil
-		}
-		// 判斷是否符合日期間隔,不符合直接結束
-		if schedule.IntervalDay > 1 {
-			CurrentDate := time.Date(BaseYear, BaseMonth, BaseDay, 0, 0, 0, 0, time.Local)
-			StartDate := time.Date(StartYear, StartMonth, StartDay, 0, 0, 0, 0, time.Local)
-			if int32(CurrentDate.Sub(StartDate).Hours())%(schedule.IntervalDay*24) != 0 {
-				Trace.Println("schedule", schedule.ID, "不符合日期間隔,直接結束")
-				return nil
-			}
-		}
-		// 判斷是否符合時間(秒數)間隔,不符合直接結束
-		if schedule.IntervalSeconds > 1 {
-			if int32(BaseTime.Sub(StartTime).Seconds())%(schedule.IntervalSeconds) != 0 {
-				Trace.Println("schedule", schedule.ID, "不符合秒數間隔,直接結束")
-				return nil
-			}
-		}
-		GetCommandFromCacheAndPublish(schedule.CommandID)
-	// 指定日期區間內->指定時間區間內->指定的星期幾->是否重複->是,指定間隔秒數
-	//											    ->否,判斷是否等於at time
-	case 2:
-		// 未達開始日期,直接結束
-		if schedule.StartDate.Sub(BaseTime) > 0 {
-			Trace.Println("schedule", schedule.ID, "未達開始日期,直接結束")
-			return nil
-		}
-		// 超過結束日期,直接結束
-		if schedule.EndDate.Sub(BaseTime) < 0 {
-			Trace.Println("schedule", schedule.ID, "超過結束日期,直接結束")
-			return nil
-		}
-		// 未達開始時間,直接結束
-		HHMMSS := strings.Split(schedule.StartTime, ":")
-		HH, err := strconv.Atoi(HHMMSS[0])
-		if err != nil {
-			Error.Println(err)
-			return err
-		}
-		MM, err := strconv.Atoi(HHMMSS[1])
-		if err != nil {
-			Error.Println(err)
-			return err
-		}
-		SS, err := strconv.Atoi(HHMMSS[2])
-		if err != nil {
-			Error.Println(err)
-			return err
-		}
-		StartTime := time.Date(BaseYear, BaseMonth, BaseDay, HH, MM, SS, 0, time.Local)
-		if StartTime.Sub(BaseTime) > 0 {
-			Trace.Println("schedule", schedule.ID, "未達開始時間,直接結束")
-			return nil
-		}
-		// 超過結束時間,直接結束
-		HHMMSS = strings.Split(schedule.EndTime, ":")
-		HH, err = strconv.Atoi(HHMMSS[0])
-		if err != nil {
-			Error.Println(err)
-			return err
-		}
-		MM, err = strconv.Atoi(HHMMSS[1])
-		if err != nil {
-			Error.Println(err)
-			return err
-		}
-		SS, err = strconv.Atoi(HHMMSS[2])
-		if err != nil {
-			Error.Println(err)
-			return err
-		}
-		EndTime := time.Date(BaseYear, BaseMonth, BaseDay, HH, MM, SS, 0, time.Local)
-		if EndTime.Sub(BaseTime) < 0 {
-			Trace.Println("schedule", schedule.ID, "超過結束時間,直接結束")
-			return nil
-		}
-		// 不在指定的星期幾內,直接結束
-		if !contains(schedule.RepeatWeekday, BaseTime.Weekday().String()) {
-			Trace.Println("schedule", schedule.ID, "不在指定的星期幾內,直接結束")
-			return nil
-		}
-		// 是否重複->是
-		if schedule.Repeat {
-			// 判斷是否符合時間(秒數)間隔,不符合直接結束
-			if schedule.IntervalSeconds > 1 {
-				if int32(BaseTime.Sub(StartTime).Seconds())%(schedule.IntervalSeconds) != 0 {
-					Trace.Println("schedule", schedule.ID, "不符合秒數間隔,直接結束")
-					return nil
+	for {
+		select {
+		case <-close:
+			Info.Println("closing")
+			return
+		default:
+			StartYear, StartMonth, StartDay := schedule.StartDate.Date()
+			BaseYear, BaseMonth, BaseDay := BaseTime.Date()
+			switch schedule.TimeTypeID {
+			// 只執行一次, 計算出唯一的執行時間比對符合後觸發
+			case 0:
+				HHMMSS := strings.Split(schedule.AtTime, ":")
+				HH, err := strconv.Atoi(HHMMSS[0])
+				if err != nil {
+					Error.Println(err)
+					return
 				}
-			}
-		} else {
-			// 是否重複->否
-			HHMMSS = strings.Split(schedule.AtTime, ":")
-			HH, err = strconv.Atoi(HHMMSS[0])
-			if err != nil {
-				Error.Println(err)
-				return err
-			}
-			MM, err = strconv.Atoi(HHMMSS[1])
-			if err != nil {
-				Error.Println(err)
-				return err
-			}
-			SS, err = strconv.Atoi(HHMMSS[2])
-			if err != nil {
-				Error.Println(err)
-				return err
-			}
-
-			targetTime := time.Date(BaseTime.Year(), BaseTime.Month(), BaseTime.Day(), HH, MM, SS, 0, time.Local)
-			timeDiff := targetTime.Sub(BaseTime)
-			//Trace.Println(targetTime, BaseTime, timeDiff)
-			if timeDiff != 0 {
-				Trace.Println("schedule", schedule.ID, "不為指定的時間(AtTime),直接結束")
-				return nil
-			}
-		}
-
-		GetCommandFromCacheAndPublish(schedule.CommandID)
-	// 指定日期區間內->指定時間區間內->指定的月->指定的日->是否重複->是,指定間隔秒數
-	//											         ->否,判斷是否等於at time
-	case 3:
-		// 未達開始日期,直接結束
-		if schedule.StartDate.Sub(BaseTime) > 0 {
-			Trace.Println("schedule", schedule.ID, "未達開始日期,直接結束")
-			return nil
-		}
-		// 超過結束日期,直接結束
-		if schedule.EndDate.Sub(BaseTime) < 0 {
-			Trace.Println("schedule", schedule.ID, "超過結束日期,直接結束")
-			return nil
-		}
-		// 未達開始時間,直接結束
-		HHMMSS := strings.Split(schedule.StartTime, ":")
-		HH, err := strconv.Atoi(HHMMSS[0])
-		if err != nil {
-			Error.Println(err)
-			return err
-		}
-		MM, err := strconv.Atoi(HHMMSS[1])
-		if err != nil {
-			Error.Println(err)
-			return err
-		}
-		SS, err := strconv.Atoi(HHMMSS[2])
-		if err != nil {
-			Error.Println(err)
-			return err
-		}
-		StartTime := time.Date(BaseYear, BaseMonth, BaseDay, HH, MM, SS, 0, time.Local)
-		if StartTime.Sub(BaseTime) > 0 {
-			Trace.Println("schedule", schedule.ID, "未達開始時間,直接結束")
-			return nil
-		}
-		// 超過結束時間,直接結束
-		HHMMSS = strings.Split(schedule.EndTime, ":")
-		HH, err = strconv.Atoi(HHMMSS[0])
-		if err != nil {
-			Error.Println(err)
-			return err
-		}
-		MM, err = strconv.Atoi(HHMMSS[1])
-		if err != nil {
-			Error.Println(err)
-			return err
-		}
-		SS, err = strconv.Atoi(HHMMSS[2])
-		if err != nil {
-			Error.Println(err)
-			return err
-		}
-		EndTime := time.Date(BaseYear, BaseMonth, BaseDay, HH, MM, SS, 0, time.Local)
-		if EndTime.Sub(BaseTime) < 0 {
-			Trace.Println("schedule", schedule.ID, "超過結束時間,直接結束")
-			return nil
-		}
-		// 不在指定的月裡,直接結束
-		if !contains(schedule.RepeatMonth, strconv.Itoa(int(BaseTime.Month()))) {
-			Trace.Println("schedule", schedule.ID, "不在指定的月裡,直接結束")
-			return nil
-		}
-		// 不在指定的日裡,直接結束
-		if !contains(schedule.RepeatDay, strconv.Itoa(int(BaseTime.Day()))) {
-			Trace.Println("schedule", schedule.ID, "不在指定的日裡,直接結束")
-			return nil
-		}
-		// 是否重複->是
-		if schedule.Repeat {
-			// 判斷是否符合時間(秒數)間隔,不符合直接結束
-			if schedule.IntervalSeconds > 1 {
-				if int32(BaseTime.Sub(StartTime).Seconds())%(schedule.IntervalSeconds) != 0 {
-					Trace.Println("schedule", schedule.ID, "不符合秒數間隔,直接結束")
-					return nil
+				MM, err := strconv.Atoi(HHMMSS[1])
+				if err != nil {
+					Error.Println(err)
+					return
 				}
-			}
-		} else {
-			// 是否重複->否
-			HHMMSS = strings.Split(schedule.AtTime, ":")
-			HH, err = strconv.Atoi(HHMMSS[0])
-			if err != nil {
-				Error.Println(err)
-				return err
-			}
-			MM, err = strconv.Atoi(HHMMSS[1])
-			if err != nil {
-				Error.Println(err)
-				return err
-			}
-			SS, err = strconv.Atoi(HHMMSS[2])
-			if err != nil {
-				Error.Println(err)
-				return err
-			}
+				SS, err := strconv.Atoi(HHMMSS[2])
+				if err != nil {
+					Error.Println(err)
+					return
+				}
 
-			targetTime := time.Date(BaseTime.Year(), BaseTime.Month(), BaseTime.Day(), HH, MM, SS, 0, time.Local)
-			timeDiff := targetTime.Sub(BaseTime)
-			if timeDiff != 0 {
-				Trace.Println("schedule", schedule.ID, "不為指定的時間(AtTime),直接結束")
-				return nil
+				targetTime := time.Date(StartYear, StartMonth, StartDay, HH, MM, SS, 0, time.Local)
+				timeDiff := targetTime.Sub(BaseTime)
+				//Trace.Println(targetTime, current, timeDiff)
+				if timeDiff == 0 {
+					_ = GetCommandFromCacheAndPublish(int(schedule.ID), schedule.CommandID)
+				}
+				Trace.Println("schedule", schedule.ID, "非指定時間,直接結束")
+			// 指定日期區間內->每天(間隔?天)->指定時間區間內->指定間隔秒數
+			case 1:
+				// 未達開始日期,直接結束
+				if schedule.StartDate.Sub(BaseTime) > 0 {
+					Trace.Println("schedule", schedule.ID, "未達開始日期,直接結束")
+					return
+				}
+				// 超過結束日期,直接結束
+				if schedule.EndDate.Sub(BaseTime) < 0 {
+					Trace.Println("schedule", schedule.ID, "超過結束日期,直接結束")
+					return
+				}
+				// 未達開始時間,直接結束
+				HHMMSS := strings.Split(schedule.StartTime, ":")
+				HH, err := strconv.Atoi(HHMMSS[0])
+				if err != nil {
+					Error.Println(err)
+					return
+				}
+				MM, err := strconv.Atoi(HHMMSS[1])
+				if err != nil {
+					Error.Println(err)
+					return
+				}
+				SS, err := strconv.Atoi(HHMMSS[2])
+				if err != nil {
+					Error.Println(err)
+					return
+				}
+				StartTime := time.Date(BaseYear, BaseMonth, BaseDay, HH, MM, SS, 0, time.Local)
+				if StartTime.Sub(BaseTime) > 0 {
+					Trace.Println("schedule", schedule.ID, "未達開始時間,直接結束")
+					return
+				}
+				// 超過結束時間,直接結束
+				HHMMSS = strings.Split(schedule.EndTime, ":")
+				HH, err = strconv.Atoi(HHMMSS[0])
+				if err != nil {
+					Error.Println(err)
+					return
+				}
+				MM, err = strconv.Atoi(HHMMSS[1])
+				if err != nil {
+					Error.Println(err)
+					return
+				}
+				SS, err = strconv.Atoi(HHMMSS[2])
+				if err != nil {
+					Error.Println(err)
+					return
+				}
+				EndTime := time.Date(BaseYear, BaseMonth, BaseDay, HH, MM, SS, 0, time.Local)
+				if EndTime.Sub(BaseTime) < 0 {
+					Trace.Println("schedule", schedule.ID, "超過結束時間,直接結束")
+					return
+				}
+				// 判斷是否符合日期間隔,不符合直接結束
+				if schedule.IntervalDay > 1 {
+					CurrentDate := time.Date(BaseYear, BaseMonth, BaseDay, 0, 0, 0, 0, time.Local)
+					StartDate := time.Date(StartYear, StartMonth, StartDay, 0, 0, 0, 0, time.Local)
+					if int32(CurrentDate.Sub(StartDate).Hours())%(schedule.IntervalDay*24) != 0 {
+						Trace.Println("schedule", schedule.ID, "不符合日期間隔,直接結束")
+						return
+					}
+				}
+				// 判斷是否符合時間(秒數)間隔,不符合直接結束
+				if schedule.IntervalSeconds > 1 {
+					if int32(BaseTime.Sub(StartTime).Seconds())%(schedule.IntervalSeconds) != 0 {
+						Trace.Println("schedule", schedule.ID, "不符合秒數間隔,直接結束")
+						return
+					}
+				}
+				_ = GetCommandFromCacheAndPublish(int(schedule.ID), schedule.CommandID)
+			// 指定日期區間內->指定時間區間內->指定的星期幾->是否重複->是,指定間隔秒數
+			//											    ->否,判斷是否等於at time
+			case 2:
+				// 未達開始日期,直接結束
+				if schedule.StartDate.Sub(BaseTime) > 0 {
+					Trace.Println("schedule", schedule.ID, "未達開始日期,直接結束")
+					return
+				}
+				// 超過結束日期,直接結束
+				if schedule.EndDate.Sub(BaseTime) < 0 {
+					Trace.Println("schedule", schedule.ID, "超過結束日期,直接結束")
+					return
+				}
+				// 未達開始時間,直接結束
+				HHMMSS := strings.Split(schedule.StartTime, ":")
+				HH, err := strconv.Atoi(HHMMSS[0])
+				if err != nil {
+					Error.Println(err)
+					return
+				}
+				MM, err := strconv.Atoi(HHMMSS[1])
+				if err != nil {
+					Error.Println(err)
+					return
+				}
+				SS, err := strconv.Atoi(HHMMSS[2])
+				if err != nil {
+					Error.Println(err)
+					return
+				}
+				StartTime := time.Date(BaseYear, BaseMonth, BaseDay, HH, MM, SS, 0, time.Local)
+				if StartTime.Sub(BaseTime) > 0 {
+					Trace.Println("schedule", schedule.ID, "未達開始時間,直接結束")
+					return
+				}
+				// 超過結束時間,直接結束
+				HHMMSS = strings.Split(schedule.EndTime, ":")
+				HH, err = strconv.Atoi(HHMMSS[0])
+				if err != nil {
+					Error.Println(err)
+					return
+				}
+				MM, err = strconv.Atoi(HHMMSS[1])
+				if err != nil {
+					Error.Println(err)
+					return
+				}
+				SS, err = strconv.Atoi(HHMMSS[2])
+				if err != nil {
+					Error.Println(err)
+					return
+				}
+				EndTime := time.Date(BaseYear, BaseMonth, BaseDay, HH, MM, SS, 0, time.Local)
+				if EndTime.Sub(BaseTime) < 0 {
+					Trace.Println("schedule", schedule.ID, "超過結束時間,直接結束")
+					return
+				}
+				// 不在指定的星期幾內,直接結束
+				if !contains(schedule.RepeatWeekday, BaseTime.Weekday().String()) {
+					Trace.Println("schedule", schedule.ID, "不在指定的星期幾內,直接結束")
+					return
+				}
+				// 是否重複->是
+				if schedule.Repeat {
+					// 判斷是否符合時間(秒數)間隔,不符合直接結束
+					if schedule.IntervalSeconds > 1 {
+						if int32(BaseTime.Sub(StartTime).Seconds())%(schedule.IntervalSeconds) != 0 {
+							Trace.Println("schedule", schedule.ID, "不符合秒數間隔,直接結束")
+							return
+						}
+					}
+				} else {
+					// 是否重複->否
+					HHMMSS = strings.Split(schedule.AtTime, ":")
+					HH, err = strconv.Atoi(HHMMSS[0])
+					if err != nil {
+						Error.Println(err)
+						return
+					}
+					MM, err = strconv.Atoi(HHMMSS[1])
+					if err != nil {
+						Error.Println(err)
+						return
+					}
+					SS, err = strconv.Atoi(HHMMSS[2])
+					if err != nil {
+						Error.Println(err)
+						return
+					}
+
+					targetTime := time.Date(BaseTime.Year(), BaseTime.Month(), BaseTime.Day(), HH, MM, SS, 0, time.Local)
+					timeDiff := targetTime.Sub(BaseTime)
+					//Trace.Println(targetTime, BaseTime, timeDiff)
+					if timeDiff != 0 {
+						Trace.Println("schedule", schedule.ID, "不為指定的時間(AtTime),直接結束")
+						return
+					}
+				}
+
+				_ = GetCommandFromCacheAndPublish(int(schedule.ID), schedule.CommandID)
+			// 指定日期區間內->指定時間區間內->指定的月->指定的日->是否重複->是,指定間隔秒數
+			//											         ->否,判斷是否等於at time
+			case 3:
+				// 未達開始日期,直接結束
+				if schedule.StartDate.Sub(BaseTime) > 0 {
+					Trace.Println("schedule", schedule.ID, "未達開始日期,直接結束")
+					return
+				}
+				// 超過結束日期,直接結束
+				if schedule.EndDate.Sub(BaseTime) < 0 {
+					Trace.Println("schedule", schedule.ID, "超過結束日期,直接結束")
+					return
+				}
+				// 未達開始時間,直接結束
+				HHMMSS := strings.Split(schedule.StartTime, ":")
+				HH, err := strconv.Atoi(HHMMSS[0])
+				if err != nil {
+					Error.Println(err)
+					return
+				}
+				MM, err := strconv.Atoi(HHMMSS[1])
+				if err != nil {
+					Error.Println(err)
+					return
+				}
+				SS, err := strconv.Atoi(HHMMSS[2])
+				if err != nil {
+					Error.Println(err)
+					return
+				}
+				StartTime := time.Date(BaseYear, BaseMonth, BaseDay, HH, MM, SS, 0, time.Local)
+				if StartTime.Sub(BaseTime) > 0 {
+					Trace.Println("schedule", schedule.ID, "未達開始時間,直接結束")
+					return
+				}
+				// 超過結束時間,直接結束
+				HHMMSS = strings.Split(schedule.EndTime, ":")
+				HH, err = strconv.Atoi(HHMMSS[0])
+				if err != nil {
+					Error.Println(err)
+					return
+				}
+				MM, err = strconv.Atoi(HHMMSS[1])
+				if err != nil {
+					Error.Println(err)
+					return
+				}
+				SS, err = strconv.Atoi(HHMMSS[2])
+				if err != nil {
+					Error.Println(err)
+					return
+				}
+				EndTime := time.Date(BaseYear, BaseMonth, BaseDay, HH, MM, SS, 0, time.Local)
+				if EndTime.Sub(BaseTime) < 0 {
+					Trace.Println("schedule", schedule.ID, "超過結束時間,直接結束")
+					return
+				}
+				// 不在指定的月裡,直接結束
+				if !contains(schedule.RepeatMonth, strconv.Itoa(int(BaseTime.Month()))) {
+					Trace.Println("schedule", schedule.ID, "不在指定的月裡,直接結束")
+					return
+				}
+				// 不在指定的日裡,直接結束
+				if !contains(schedule.RepeatDay, strconv.Itoa(BaseTime.Day())) {
+					Trace.Println("schedule", schedule.ID, "不在指定的日裡,直接結束")
+					return
+				}
+				// 是否重複->是
+				if schedule.Repeat {
+					// 判斷是否符合時間(秒數)間隔,不符合直接結束
+					if schedule.IntervalSeconds > 1 {
+						if int32(BaseTime.Sub(StartTime).Seconds())%(schedule.IntervalSeconds) != 0 {
+							Trace.Println("schedule", schedule.ID, "不符合秒數間隔,直接結束")
+							return
+						}
+					}
+				} else {
+					// 是否重複->否
+					HHMMSS = strings.Split(schedule.AtTime, ":")
+					HH, err = strconv.Atoi(HHMMSS[0])
+					if err != nil {
+						Error.Println(err)
+						return
+					}
+					MM, err = strconv.Atoi(HHMMSS[1])
+					if err != nil {
+						Error.Println(err)
+						return
+					}
+					SS, err = strconv.Atoi(HHMMSS[2])
+					if err != nil {
+						Error.Println(err)
+						return
+					}
+
+					targetTime := time.Date(BaseTime.Year(), BaseTime.Month(), BaseTime.Day(), HH, MM, SS, 0, time.Local)
+					timeDiff := targetTime.Sub(BaseTime)
+					if timeDiff != 0 {
+						Trace.Println("schedule", schedule.ID, "不為指定的時間(AtTime),直接結束")
+						return
+					}
+				}
+
+				_ = GetCommandFromCacheAndPublish(int(schedule.ID), schedule.CommandID)
+
+			default:
+				Error.Println("schedule", schedule.ID, "Time TYPE ID error")
 			}
+			return
 		}
-
-		GetCommandFromCacheAndPublish(schedule.CommandID)
-
-	default:
-		Error.Println("schedule", schedule.ID, "Time TYPE ID error")
 	}
-	return nil
+
 }
 
 // schedule符合觸發條件取cache中的command字串後發送
-func GetCommandFromCacheAndPublish(CommandID int32) error {
+func GetCommandFromCacheAndPublish(ScheduleID int, CommandID int32) error {
 	commands, err := GC.Get("command")
 	if err != nil {
 		Error.Println(err)
 		return err
 	}
-	commandList, ok := commands.([]db.Command)
+	commandList, ok := commands.([]cacheCommand)
 	if !ok {
 		Error.Println("type assert error")
 		return errors.New("type assert error")
@@ -608,13 +703,14 @@ func GetCommandFromCacheAndPublish(CommandID int32) error {
 			targetCommand = command.Command
 		}
 	}
-	Trace.Println("Trigger :" + targetCommand)
+	Trace.Println("ScheduleID:" + strconv.Itoa(ScheduleID) + "; Trigger :" + targetCommand)
 	return nil
 }
 
 // schedule變更更新cache
 func UpdateCacheSchedule(id int) (err error) {
-	result, err := GetScheduleOne(CRUDconfig, id)
+	//result, err := GetScheduleOne(CRUDconfig, id)
+	result, err := GRPCGetScheduleOne(CRUDconfig, int32(id))
 	if err != nil {
 		return
 	}
@@ -629,14 +725,9 @@ func UpdateCacheSchedule(id int) (err error) {
 		return
 	}
 	// 將排程寫進cache並設置到期時間
-	err = GC.SetWithExpire(id, result.Data, timeDiff)
+	err = GC.SetWithExpire(int32(id), result.Data, timeDiff)
 	if err != nil {
 		return
 	}
 	return
-}
-
-// command變更更新cache
-func UpdateCacheCommand() {
-
 }
