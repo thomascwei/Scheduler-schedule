@@ -1,13 +1,18 @@
 package main
 
 import (
+	"context"
 	"github.com/gin-gonic/gin"
 	"github.com/jasonlvhit/gocron"
 	"io"
 	"log"
+	"net/http"
 	"os"
+	"os/signal"
 	"path/filepath"
 	"scheduler/internal"
+	"syscall"
+	"time"
 )
 
 var (
@@ -35,7 +40,7 @@ func init() {
 		log.Fatal("initial schedule cache fail: " + err.Error())
 	}
 	//
-	err = internal.PrepareAllCommandsStoreInCache(internal.CRUDconfig)
+	err = internal.GPRCPrepareAllCommandsStoreInCache(internal.CRUDconfig)
 	if err != nil {
 		log.Fatal("initial commands cache fail: " + err.Error())
 	}
@@ -43,8 +48,11 @@ func init() {
 }
 func main() {
 
+	closing := make(chan struct{})
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+
 	go func() {
-		gocron.Every(1).Second().Do(internal.GocronRealAllCachedSchedule)
+		gocron.Every(1).Second().Do(internal.GocronRealAllCachedSchedule, closing)
 		<-gocron.Start()
 	}()
 
@@ -52,5 +60,18 @@ func main() {
 	r := gin.Default()
 	r.POST("/schedule/V1/update_cached_schedule", internal.UpdateScheduleRoute)
 	r.GET("/schedule/V1/update_cached_commands", internal.UpdateAllCommandsRoute)
-	r.Run(":9568")
+	srv := &http.Server{
+		Addr:    ":9568",
+		Handler: r,
+	}
+	signals := make(chan os.Signal, 1)
+	signal.Notify(signals, syscall.SIGTERM, syscall.SIGKILL, syscall.SIGINT, os.Interrupt)
+	rr := <-signals
+	Info.Println(rr.String() + " shutdown.")
+	close(closing)
+	cancel()
+
+	if err := srv.Shutdown(ctx); err != nil {
+		log.Fatal("Server Shutdown:", err)
+	}
 }
