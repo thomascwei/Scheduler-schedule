@@ -8,7 +8,7 @@ RUN go build -o main .
 # Run stage
 FROM alpine:3.13
 RUN mkdir /app
-ADD . /app/
+ADD ./config /app/config
 COPY --from=builder /build/main /app
 WORKDIR /app
 EXPOSE 9568
