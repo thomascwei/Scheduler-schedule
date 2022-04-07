@@ -1,9 +1,12 @@
-FROM golang:alpine as builder
+# Build stage
+FROM golang:1.16-alpine3.13 AS builder
 RUN mkdir /build
 ADD . /build/
 WORKDIR /build
 RUN go build -o main .
-FROM alpine
+
+# Run stage
+FROM alpine:3.13
 RUN mkdir /app
 ADD . /app/
 COPY --from=builder /build/main /app
